@@ -5,7 +5,7 @@ import json
 import operator
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException, InvalidOperation
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
@@ -179,7 +179,7 @@ _SUPPORTED_OPERATIONS = {
     "round",
     "if_else",
 }
-_SUPPORTED_TYPES = {"string", "integer", "number", "decimal", "boolean", "date"}
+_SUPPORTED_TYPES = {"string", "integer", "number", "decimal", "boolean", "date", "datetime"}
 _ARITHMETIC_OPERATIONS: dict[str, Callable[[Any, Any], Any]] = {
     "add": operator.add,
     "subtract": operator.sub,
@@ -408,17 +408,25 @@ def _normalize_mapping_keys(entry: Mapping[str, Any]) -> dict[str, Any]:
         aliases = {
             "source": "source_column",
             "source_field": "source_column",
+            "source_column_name": "source_column",
+            "source_field_name": "source_column",
             "source_columns": "source_columns",
             "target": "target_column",
             "target_field": "target_column",
+            "target_column_name": "target_column",
+            "target_field_name": "target_column",
             "transformation_rule": "transform",
+            "transformation_type": "transform",
             "target_data_type": "target_type",
             "data_type": "target_type",
             "length": "target_length",
             "max_length": "target_length",
             "is_nullable": "nullable",
         }
-        normalized[aliases.get(normalized_key, normalized_key)] = value
+        normalized_key = aliases.get(normalized_key, normalized_key)
+        if normalized_key in normalized:
+            raise ValueError(f"Mapping document contains duplicate field '{normalized_key}'.")
+        normalized[normalized_key] = value
     return normalized
 
 
@@ -491,10 +499,10 @@ def _normalize_target_type(target_type: str) -> str:
         "numeric": "decimal",
         "bool": "boolean",
         "bit": "boolean",
-        "datetime": "date",
-        "timestamp": "date",
-        "timestamp with time zone": "date",
-        "timestamp without time zone": "date",
+        "datetime": "datetime",
+        "timestamp": "datetime",
+        "timestamp with time zone": "datetime",
+        "timestamp without time zone": "datetime",
     }
     normalized = target_type.strip().lower()
     if normalized in aliases:
@@ -587,7 +595,7 @@ def _apply_operation(operation: str, values: list[Any], options: Mapping[str, An
             for value in numbers[1:]:
                 result = _ARITHMETIC_OPERATIONS[operation](result, value)
             return result
-        except (InvalidOperation, TypeError, ZeroDivisionError) as error:
+        except (DecimalException, InvalidOperation, TypeError, ZeroDivisionError) as error:
             raise ValueError(f"Transformation '{operation}' could not be applied to its inputs.") from error
     raise ValueError(f"Unsupported transformation '{operation}'.")
 
@@ -627,6 +635,12 @@ def _cast_value(value: Any, target_type: str, target_column: str) -> Any:
             if isinstance(value, date):
                 return value
             return date.fromisoformat(str(value))
+        if target_type == "datetime":
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, date):
+                return datetime.combine(value, datetime.min.time())
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except (ValueError, TypeError, InvalidOperation) as error:
         raise ValueError(
             f"Value for target '{target_column}' cannot be converted to '{target_type}'."

@@ -1,0 +1,47 @@
+{
+  "etl_integrations": [
+    {
+      "name": "adf-prod",
+      "provider": "adf",
+      "enabled": true,
+      "settings": {
+        "subscription_id": "your-subscription-id",
+        "resource_group": "your-resource-group",
+        "factory_name": "your-data-factory"
+      },
+      "credentials_env": {
+        "tenant_id": "ADF_TENANT_ID",
+        "client_id": "ADF_CLIENT_ID",
+        "client_secret": "ADF_CLIENT_SECRET"
+      }
+    },
+    {
+      "name": "ssis-warehouse",
+      "provider": "ssis",
+      "enabled": true,
+      "settings": {
+        "server": "your-ssis-server",
+        "catalog": "SSISDB",
+        "folder": "your-folder",
+        "project": "your-project"
+      },
+      "credentials_env": {
+        "username": "SSIS_USERNAME",
+        "password": "SSIS_PASSWORD"
+      }
+    },
+    {
+      "name": "glue-analytics",
+      "provider": "aws_glue",
+      "enabled": true,
+      "settings": {
+        "region": "us-east-1",
+        "account_id": "your-aws-account-id"
+      },
+      "credentials_env": {
+        "access_key_id": "AWS_ACCESS_KEY_ID",
+        "secret_access_key": "AWS_SECRET_ACCESS_KEY"
+      }
+    }
+  ]
+}

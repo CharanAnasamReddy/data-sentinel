@@ -12,5 +12,8 @@ authors = [{ name = "DataSentinel" }]
 license = { text = "MIT" }
 keywords = ["etl", "data-quality", "testing", "reconciliation", "lineage"]
 
+[project.optional-dependencies]
+mappings = ["PyYAML>=6.0", "openpyxl>=3.1"]
+
 [tool.setuptools]
 packages = ["datasentinel"]

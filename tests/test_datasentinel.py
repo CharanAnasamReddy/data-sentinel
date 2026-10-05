@@ -1,13 +1,319 @@
+import importlib.util
+import json
+import tempfile
 import unittest
+from decimal import Decimal
+from pathlib import Path
 
 from datasentinel.ai_agent import AIAgent
 from datasentinel.cli import run_example
+from datasentinel.connections import ConnectionSettings
 from datasentinel.deterministic_engine import (
     DeterministicTestingEngine,
     ValidationStatus,
 )
 from datasentinel.events import EventStore
+from datasentinel.mappings import load_mapping_document, parse_mapping_document
 from datasentinel.visualization import ExecutiveDashboard
+
+
+class ConnectionSettingsTests(unittest.TestCase):
+    def test_connection_strings_load_from_environment_mapping(self):
+        settings = ConnectionSettings.from_environment({
+            "DATASENTINEL_SOURCE_CONNECTION_STRING": "source-secret",
+            "DATASENTINEL_TARGET_CONNECTION_STRING": "target-secret",
+        })
+
+        self.assertEqual(
+            settings.require_source_and_target(),
+            ("source-secret", "target-secret"),
+        )
+        self.assertNotIn("source-secret", repr(settings))
+        self.assertNotIn("target-secret", repr(settings))
+
+    def test_named_adf_ssis_and_glue_integrations_load_together(self):
+        configuration = {
+            "etl_integrations": [
+                {
+                    "name": "adf-prod",
+                    "provider": "adf",
+                    "settings": {"factory_name": "factory-a"},
+                    "credentials_env": {"client_secret": "ADF_SECRET"},
+                },
+                {
+                    "name": "ssis-warehouse",
+                    "provider": "ssis",
+                    "settings": {"server": "ssis.example"},
+                    "credentials_env": {"password": "SSIS_PASSWORD"},
+                },
+                {
+                    "name": "glue-analytics",
+                    "provider": "aws_glue",
+                    "settings": {"region": "us-east-1"},
+                    "credentials_env": {"secret_key": "AWS_SECRET"},
+                },
+            ]
+        }
+        environment = {
+            "ADF_SECRET": "adf-secret-value",
+            "SSIS_PASSWORD": "ssis-secret-value",
+            "AWS_SECRET": "glue-secret-value",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "integrations.json"
+            config_path.write_text(json.dumps(configuration), encoding="utf-8")
+            settings = ConnectionSettings.from_environment(
+                environ=environment,
+                integrations_path=config_path,
+            )
+
+        self.assertEqual(
+            [(item.name, item.provider) for item in settings.etl_integrations],
+            [
+                ("adf-prod", "adf"),
+                ("ssis-warehouse", "ssis"),
+                ("glue-analytics", "aws_glue"),
+            ],
+        )
+        self.assertEqual(
+            settings.get_etl_integration("adf-prod").credentials["client_secret"],
+            "adf-secret-value",
+        )
+        self.assertEqual(len(settings.enabled_etl_integrations), 3)
+        self.assertNotIn("adf-secret-value", repr(settings))
+
+    def test_etl_integrations_are_optional_and_provider_is_extensible(self):
+        settings = ConnectionSettings.from_environment({})
+        self.assertEqual(settings.etl_integrations, ())
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "integrations.json"
+            config_path.write_text(
+                '{"etl_integrations":[{"name":"custom","provider":"future_tool"}]}',
+                encoding="utf-8",
+            )
+            configured = ConnectionSettings.from_environment(integrations_path=config_path)
+
+        self.assertEqual(configured.get_etl_integration("custom").provider, "future_tool")
+        with self.assertRaisesRegex(KeyError, "not configured"):
+            configured.get_etl_integration("missing")
+
+    def test_disabled_integration_does_not_require_credential_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "integrations.json"
+            config_path.write_text(
+                '{"etl_integrations":[{"name":"adf-disabled","provider":"adf",'
+                '"enabled":false,"credentials_env":{"client_secret":"ADF_CLIENT_SECRET"}}]}',
+                encoding="utf-8",
+            )
+            settings = ConnectionSettings.from_environment(
+                environ={},
+                integrations_path=config_path,
+            )
+
+        self.assertEqual(len(settings.etl_integrations), 1)
+        self.assertFalse(settings.etl_integrations[0].enabled)
+        self.assertEqual(settings.enabled_etl_integrations, ())
+
+    def test_duplicate_integration_names_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "integrations.json"
+            config_path.write_text(
+                '{"etl_integrations":['
+                '{"name":"same","provider":"adf"},'
+                '{"name":"same","provider":"ssis"}]}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "Duplicate ETL integration name"):
+                ConnectionSettings.from_environment(integrations_path=config_path)
+
+    def test_missing_integration_credential_reports_variable_without_secret(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "integrations.json"
+            config_path.write_text(
+                '{"etl_integrations":[{"name":"adf","provider":"adf",'
+                '"credentials_env":{"client_secret":"ADF_CLIENT_SECRET"}}]}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "ADF_CLIENT_SECRET"):
+                ConnectionSettings.from_environment(
+                    environ={},
+                    integrations_path=config_path,
+                )
+
+    def test_missing_connection_strings_raise_clear_error_without_values(self):
+        settings = ConnectionSettings.from_environment({})
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "DATASENTINEL_SOURCE_CONNECTION_STRING.*DATASENTINEL_TARGET_CONNECTION_STRING",
+        ) as error:
+            settings.require_source_and_target()
+
+        self.assertNotIn("secret", str(error.exception))
+
+    def test_blank_connection_strings_are_treated_as_missing(self):
+        settings = ConnectionSettings.from_environment({
+            "DATASENTINEL_SOURCE_CONNECTION_STRING": " ",
+            "DATASENTINEL_TARGET_CONNECTION_STRING": "target-secret",
+        })
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "DATASENTINEL_SOURCE_CONNECTION_STRING",
+        ):
+            settings.require_source_and_target()
+
+
+class MappingDocumentTests(unittest.TestCase):
+    def test_json_mapping_builds_and_applies_deterministic_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "customer.json"
+            path.write_text(json.dumps({
+                "name": "customer mapping",
+                "source_columns": ["first_name", "last_name", "gross", "tax"],
+                "target_columns": ["full_name", "net"],
+                "mappings": [
+                    {
+                        "source_columns": ["first_name", "last_name"],
+                        "target_column": "full_name",
+                        "transform": {"op": "concat", "separator": " "},
+                        "target_type": "varchar(50)",
+                        "target_length": 50,
+                    },
+                    {
+                        "source_columns": ["gross", "tax"],
+                        "target_column": "net",
+                        "transform": "subtract",
+                        "target_type": "decimal(12,2)",
+                    },
+                ],
+            }), encoding="utf-8")
+            mapping = load_mapping_document(path)
+
+        rules = mapping.build_transformation_rules()
+        output = {
+            target: rule({
+                "first_name": "Ada",
+                "last_name": "Lovelace",
+                "gross": "100.25",
+                "tax": "10.25",
+            })
+            for target, rule in rules.items()
+        }
+
+        self.assertEqual(output["full_name"], "Ada Lovelace")
+        self.assertEqual(output["net"], Decimal("90.00"))
+        self.assertEqual(mapping.transform_record({
+            "first_name": "Ada",
+            "last_name": "Lovelace",
+            "gross": "100.25",
+            "tax": "10.25",
+        }), output)
+
+    def test_csv_mapping_normalizes_common_headers_and_generates_trim_rule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "names.csv"
+            path.write_text(
+                "Source Column,Target Column,Transformation Rule,Target Data Type\n"
+                "raw_name,clean_name,trim,string\n",
+                encoding="utf-8",
+            )
+            mapping = load_mapping_document(path)
+
+        self.assertEqual(
+            mapping.transform_record({"raw_name": "  DataSentinel  "}),
+            {"clean_name": "DataSentinel"},
+        )
+
+    def test_csv_mapping_supports_encoded_multi_source_transformations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "amounts.csv"
+            path.write_text(
+                'Source Columns,Target Column,Transformation Rule,Target Data Type\n'
+                '"[""gross"",""tax""]",net,"{""op"":""subtract""}",decimal(12,2)\n',
+                encoding="utf-8",
+            )
+            mapping = load_mapping_document(path)
+
+        self.assertEqual(
+            mapping.transform_record({"gross": "125.50", "tax": "25.50"}),
+            {"net": Decimal("100.00")},
+        )
+
+    def test_mapping_validates_schema_and_required_target_constraints(self):
+        mapping = parse_mapping_document({
+            "source_columns": ["name"],
+            "target_columns": ["name"],
+            "mappings": [{
+                "source_column": "name",
+                "target_column": "name",
+                "nullable": False,
+                "target_length": 5,
+            }],
+        })
+
+        self.assertEqual(
+            mapping.validate_source_schema(["name", "unexpected"]),
+            {"missing": [], "extra": ["unexpected"]},
+        )
+        with self.assertRaisesRegex(ValueError, "produced null"):
+            mapping.transform_record({"name": None})
+        with self.assertRaisesRegex(ValueError, "exceeds its configured length"):
+            mapping.transform_record({"name": "too long"})
+
+    def test_unsupported_executable_expression_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported transformation"):
+            parse_mapping_document({
+                "mappings": [{
+                    "source_column": "name",
+                    "target_column": "name",
+                    "transform": "__import__('os').system('echo unsafe')",
+                }],
+            })
+
+    def test_duplicate_target_mappings_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "mapped more than once"):
+            parse_mapping_document({
+                "mappings": [
+                    {"source_column": "first", "target_column": "name"},
+                    {"source_column": "last", "target_column": "name"},
+                ],
+            })
+
+    def test_yaml_mapping_is_supported_when_optional_dependency_is_installed(self):
+        if importlib.util.find_spec("yaml") is None:
+            self.skipTest("Install the mappings extra to test YAML mapping support.")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mapping.yaml"
+            path.write_text(
+                "name: yaml-map\nmappings:\n"
+                "  - source_column: name\n"
+                "    target_column: name\n"
+                "    transform: upper\n",
+                encoding="utf-8",
+            )
+            mapping = load_mapping_document(path)
+        self.assertEqual(mapping.transform_record({"name": "ada"}), {"name": "ADA"})
+
+    def test_excel_mapping_is_supported_when_optional_dependency_is_installed(self):
+        if importlib.util.find_spec("openpyxl") is None:
+            self.skipTest("Install the mappings extra to test Excel mapping support.")
+        from openpyxl import Workbook
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mapping.xlsx"
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet.append(["Source Column", "Target Column", "Transformation Rule"])
+            worksheet.append(["name", "name", "upper"])
+            workbook.save(path)
+            mapping = load_mapping_document(path)
+
+        self.assertEqual(mapping.transform_record({"name": "ada"}), {"name": "ADA"})
 
 
 class DeterministicValidationTests(unittest.TestCase):

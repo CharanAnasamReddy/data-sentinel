@@ -1,0 +1,39 @@
+{
+  "name": "customer-source-to-target",
+  "source_columns": [
+    "first_name",
+    "last_name",
+    "gross_amount",
+    "tax_amount"
+  ],
+  "target_columns": [
+    "customer_name",
+    "net_amount"
+  ],
+  "mappings": [
+    {
+      "source_columns": [
+        "first_name",
+        "last_name"
+      ],
+      "target_column": "customer_name",
+      "transform": {
+        "op": "concat",
+        "separator": " "
+      },
+      "target_type": "varchar(100)",
+      "target_length": 100,
+      "nullable": false
+    },
+    {
+      "source_columns": [
+        "gross_amount",
+        "tax_amount"
+      ],
+      "target_column": "net_amount",
+      "transform": "subtract",
+      "target_type": "decimal(18,2)",
+      "nullable": false
+    }
+  ]
+}

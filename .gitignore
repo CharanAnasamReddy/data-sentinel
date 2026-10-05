@@ -1,0 +1,6 @@
+.env
+.env.*
+!.env.example
+datasentinel.integrations.json
+__pycache__/
+*.py[cod]

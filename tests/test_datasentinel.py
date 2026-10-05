@@ -6,7 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from datasentinel.ai_agent import AIAgent
-from datasentinel.cli import run_example
+from datasentinel.cli import run_example, run_self_healing_plan
 from datasentinel.connections import ConnectionSettings
 from datasentinel.deterministic_engine import (
     DeterministicTestingEngine,
@@ -14,6 +14,7 @@ from datasentinel.deterministic_engine import (
 )
 from datasentinel.events import EventStore
 from datasentinel.mappings import load_mapping_document, parse_mapping_document
+from datasentinel.self_healing import SelfHealingTestPlanner, ValidationTestCase
 from datasentinel.visualization import ExecutiveDashboard
 
 
@@ -314,6 +315,191 @@ class MappingDocumentTests(unittest.TestCase):
             mapping = load_mapping_document(path)
 
         self.assertEqual(mapping.transform_record({"name": "ada"}), {"name": "ADA"})
+
+
+class SelfHealingTestPlannerTests(unittest.TestCase):
+    def setUp(self):
+        self.mapping = parse_mapping_document({
+            "source_columns": ["first_name", "last_name"],
+            "target_columns": ["full_name"],
+            "mappings": [{
+                "source_columns": ["first_name", "last_name"],
+                "target_column": "full_name",
+                "transform": {"op": "concat", "separator": " "},
+            }],
+        })
+        self.planner = SelfHealingTestPlanner()
+
+    def test_generates_missing_schema_mapping_and_lineage_tests(self):
+        plan = self.planner.plan(
+            existing_tests=(),
+            mapping=self.mapping,
+            source_schema=["first_name", "last_name"],
+            target_schema=["full_name"],
+            lineage_edges=[
+                ("first_name", "full_name"),
+                ("last_name", "full_name"),
+            ],
+        )
+
+        self.assertEqual(len(plan.generated_tests), 5)
+        self.assertEqual(
+            {result.status for result in plan.results},
+            {ValidationStatus.PASS},
+        )
+        self.assertEqual(plan.all_tests, plan.generated_tests)
+
+    def test_preserves_existing_tests_and_only_adds_gaps(self):
+        existing = ValidationTestCase(
+            test_id="CUSTOM-SOURCE",
+            kind="source_schema",
+            name="Existing source schema test",
+            coverage_key="schema:source",
+            expected_columns=("first_name", "last_name"),
+        )
+
+        plan = self.planner.plan(
+            existing_tests=[existing],
+            mapping=self.mapping,
+            source_schema=["first_name", "last_name"],
+            target_schema=["full_name"],
+            lineage_edges=[
+                ("first_name", "full_name"),
+                ("last_name", "full_name"),
+            ],
+        )
+
+        self.assertIs(plan.existing_tests[0], existing)
+        self.assertEqual(plan.existing_tests[0], existing)
+        self.assertNotIn("schema:source", {test.coverage_key for test in plan.generated_tests})
+        self.assertEqual(len(plan.generated_tests), 4)
+        self.assertEqual(plan.stale_tests, ())
+
+    def test_marks_outdated_case_stale_but_keeps_it_and_adds_replacement(self):
+        old_case = ValidationTestCase(
+            test_id="CUSTOM-SOURCE",
+            kind="source_schema",
+            name="Original source schema test",
+            coverage_key="schema:source",
+            expected_columns=("old_name",),
+        )
+
+        plan = self.planner.plan(
+            existing_tests=[old_case],
+            mapping=self.mapping,
+            source_schema=["first_name", "last_name"],
+            target_schema=["full_name"],
+            lineage_edges=[],
+        )
+
+        self.assertEqual(plan.existing_tests, (old_case,))
+        self.assertEqual(plan.stale_tests, (old_case,))
+        self.assertIn(old_case, plan.all_tests)
+        self.assertIn("schema:source", {test.coverage_key for test in plan.generated_tests})
+        stale_results = [result for result in plan.results if result.test_id == old_case.test_id]
+        self.assertEqual(stale_results[0].status, ValidationStatus.WARN)
+
+    def test_generated_tests_fail_for_schema_and_lineage_drift(self):
+        plan = self.planner.plan(
+            existing_tests=(),
+            mapping=self.mapping,
+            source_schema=["first_name"],
+            target_schema=["wrong_target"],
+            lineage_edges=[("first_name", "full_name")],
+        )
+
+        failed = {result.test_id: result for result in plan.results if result.status == ValidationStatus.FAIL}
+        self.assertIn("AUTO-SOURCE-SCHEMA", failed)
+        self.assertIn("AUTO-TARGET-SCHEMA", failed)
+        self.assertTrue(any(result.test_id.startswith("AUTO-MAPPING-") for result in failed.values()))
+        self.assertTrue(any(result.test_id.startswith("AUTO-LINEAGE-last_name") for result in failed.values()))
+
+    def test_replanning_same_inputs_is_idempotent(self):
+        first = self.planner.plan([], self.mapping, ["first_name", "last_name"], ["full_name"], [])
+        second = self.planner.plan([], self.mapping, ["first_name", "last_name"], ["full_name"], [])
+
+        self.assertEqual(first.generated_tests, second.generated_tests)
+        self.assertEqual(
+            [(result.test_id, result.status, result.details) for result in first.results],
+            [(result.test_id, result.status, result.details) for result in second.results],
+        )
+
+    def test_cli_plan_reads_mapping_schema_lineage_and_existing_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mapping_path = root / "mapping.json"
+            source_schema_path = root / "source-schema.json"
+            target_schema_path = root / "target-schema.json"
+            lineage_path = root / "lineage.json"
+            catalog_path = root / "test-catalog.json"
+            expanded_catalog_path = root / "test-catalog-expanded.json"
+            mapping_path.write_text(json.dumps({
+                "source_columns": ["first_name", "last_name"],
+                "target_columns": ["full_name"],
+                "mappings": [{
+                    "source_columns": ["first_name", "last_name"],
+                    "target_column": "full_name",
+                    "transform": {"op": "concat", "separator": " "},
+                }],
+            }), encoding="utf-8")
+            source_schema_path.write_text(
+                '{"columns":["first_name","last_name"]}', encoding="utf-8"
+            )
+            target_schema_path.write_text('{"columns":["full_name"]}', encoding="utf-8")
+            lineage_path.write_text(
+                '{"edges":[["first_name","full_name"],["last_name","full_name"]]}',
+                encoding="utf-8",
+            )
+            catalog_path.write_text(json.dumps({"tests": [{
+                "test_id": "EXISTING-SCHEMA",
+                "kind": "source_schema",
+                "name": "existing source check",
+                "coverage_key": "schema:source",
+                "expected_columns": ["first_name", "last_name"],
+            }]}), encoding="utf-8")
+
+            result = run_self_healing_plan(
+                str(mapping_path),
+                str(source_schema_path),
+                str(target_schema_path),
+                str(lineage_path),
+                str(catalog_path),
+                str(expanded_catalog_path),
+            )
+
+        self.assertEqual(result["existing_tests"][0]["test_id"], "EXISTING-SCHEMA")
+        self.assertEqual(len(result["generated_tests"]), 4)
+        self.assertTrue(all(item["status"] == "PASS" for item in result["results"]))
+        saved_catalog = json.loads(expanded_catalog_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(saved_catalog["tests"]), 5)
+        self.assertEqual(saved_catalog["tests"][0]["test_id"], "EXISTING-SCHEMA")
+
+    def test_self_healing_never_overwrites_existing_test_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mapping_path = root / "mapping.json"
+            source_schema_path = root / "source-schema.json"
+            target_schema_path = root / "target-schema.json"
+            lineage_path = root / "lineage.json"
+            output_catalog_path = root / "test-catalog.json"
+            mapping_path.write_text(json.dumps({
+                "mappings": [{"source_column": "source", "target_column": "target"}],
+            }), encoding="utf-8")
+            source_schema_path.write_text('{"columns":["source"]}', encoding="utf-8")
+            target_schema_path.write_text('{"columns":["target"]}', encoding="utf-8")
+            lineage_path.write_text('{"edges":[["source","target"]]}', encoding="utf-8")
+            output_catalog_path.write_text("keep existing", encoding="utf-8")
+
+            with self.assertRaises(FileExistsError):
+                run_self_healing_plan(
+                    str(mapping_path),
+                    str(source_schema_path),
+                    str(target_schema_path),
+                    str(lineage_path),
+                    write_test_catalog_path=str(output_catalog_path),
+                )
+
+            self.assertEqual(output_catalog_path.read_text(encoding="utf-8"), "keep existing")
 
 
 class DeterministicValidationTests(unittest.TestCase):

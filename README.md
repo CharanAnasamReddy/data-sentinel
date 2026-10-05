@@ -84,7 +84,52 @@ The CLI can validate a mapping file and print the generated rules without connec
 python -m datasentinel.cli --validate-mapping mapping.example.json
 ```
 
-Built-in operations are `copy`, `trim`, `upper`, `lower`, `concat`, `coalesce`, `add`, `subtract`, `multiply`, `divide`, `replace`, `substring`, `round`, and `if_else`. Supported target types are `string`, `integer`, `number`, `decimal`, `boolean`, and ISO-formatted `date`, including common SQL type aliases. Unsupported transformations, missing inputs, invalid conversions, nulls for required targets, and target-length overflow produce explicit errors; values are not silently truncated.
+### Additive self-healing tests
+
+`SelfHealingTestPlanner` compares the current declarative test catalog with the uploaded mapping, observed source/target schemas, and lineage edges. It generates missing schema, mapping, and per-column lineage checks; schema or lineage drift produces failing results, and outdated catalog entries are reported as `WARN`. Existing cases are preserved byte-for-byte as catalog values and are never rewritten or deleted. New cases are returned separately and can be persisted by the caller.
+
+The Python API is:
+
+```python
+from datasentinel import SelfHealingTestPlanner, ValidationTestCase, load_mapping_document
+
+mapping = load_mapping_document("mapping.example.json")
+plan = SelfHealingTestPlanner().plan(
+    existing_tests=[
+        ValidationTestCase(
+            test_id="TC-001",
+            kind="source_schema",
+            name="Existing source schema check",
+            coverage_key="schema:source",
+            expected_columns=("first_name", "last_name", "gross_amount", "tax_amount"),
+        )
+    ],
+    mapping=mapping,
+    source_schema=["first_name", "last_name", "gross_amount", "tax_amount"],
+    target_schema=["customer_name", "net_amount"],
+    lineage_edges=[
+        ("first_name", "customer_name"),
+        ("last_name", "customer_name"),
+        ("gross_amount", "net_amount"),
+        ("tax_amount", "net_amount"),
+    ],
+)
+```
+
+For the CLI, provide schema JSON documents with a `columns` string array, a lineage JSON document with an `edges` array of `[source_column, target_column]` pairs, and optionally a test catalog JSON document with a `tests` array of declarative test cases:
+
+```bash
+python -m datasentinel.cli --heal-tests mapping.example.json \
+  --source-schema source-schema.json \
+  --target-schema target-schema.json \
+  --lineage lineage.json \
+  --test-catalog test-catalog.json \
+  --write-test-catalog test-catalog-expanded.json
+```
+
+The command prints preserved existing cases, generated additions, stale test IDs, and deterministic results. `--write-test-catalog` optionally saves the preserved plus generated cases to a **new** catalog file and refuses to overwrite an existing file. The original test catalog and test files are never changed. Its checks operate on mapping and schema metadata; actual record-level validation still requires data connectors.
+
+Built-in operations are `copy`, `trim`, `upper`, `lower`, `concat`, `coalesce`, `add`, `subtract`, `multiply`, `divide`, `replace`, `substring`, `round`, and `if_else`. Supported target types are `string`, `integer`, `number`, `decimal`, `boolean`, ISO-formatted `date`, and ISO-formatted `datetime`, including common SQL type aliases. Unsupported transformations, missing inputs, invalid conversions, nulls for required targets, and target-length overflow produce explicit errors; values are not silently truncated.
 
 ### Connection string configuration
 
@@ -121,6 +166,7 @@ AI reasoning focuses on changes across the data ecosystem—tables, columns, map
 
 - `datasentinel.deterministic_engine`: row count, schema, null, and duplicate validation logic.
 - `datasentinel.mappings`: mapping-document parsing, validation, and deterministic transformation rule generation.
+- `datasentinel.self_healing`: additive declarative test planning against mappings, schemas, and lineage.
 - `datasentinel.events`: execution event ordering and state history.
 - `datasentinel.ai_agent`: business-friendly AI analysis that never overrides deterministic pass/fail outcomes.
 - `datasentinel.visualization`: executive dashboard summaries.
